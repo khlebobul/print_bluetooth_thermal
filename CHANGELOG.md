@@ -1,3 +1,11 @@
+## [1.2.5] - 2026-09-28
+
+### Fixed
+* **iOS (CoreBluetooth Flow Control):** Added proper flow control (`canSendWriteWithoutResponse` & `peripheralIsReady`) to prevent silent packet drops on iOS 18+ when printing QR codes, raster images, or payloads > a few KB.
+* **Consecutive Prints on iOS:** `writeBytes` now only completes its Dart `Future` once all chunks have been pushed to CoreBluetooth. This fixes multiple consecutive calls (e.g., `await writeBytes`) silently dropping subsequent tickets.
+* **Dynamic MTU Sizing:** Chunks are now sized dynamically using `maximumWriteValueLength(for:)` to comply with the peripheral's negotiated ATT MTU limits.
+* **Transmission Watchdog:** Added a watchdog timer on iOS to ensure Dart Futures never hang indefinitely if the peripheral disconnects or stalls mid-transfer.
+
 ## [1.2.4] - 2026-09-01
 
 ### Correcciones y Mejoras

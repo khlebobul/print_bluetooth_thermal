@@ -241,62 +241,69 @@ class MyAppState extends State<MyApp> {
                         ],
                       ),
                       const SizedBox(height: 12),
-                      Container(
+                      // ✅ DESPUÉS (Solución correcta con Material)
+                      SizedBox(
                         height: 200,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(12),
+                        child: Material(
                           color: Theme.of(context).colorScheme.surfaceContainerLowest,
-                          border: Border.all(color: Theme.of(context).colorScheme.outlineVariant, width: 0.5),
-                        ),
-                        child: items.isEmpty
-                            ? Center(
-                                child: Padding(
-                                  padding: const EdgeInsets.all(16.0),
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      Icon(Icons.print_disabled, size: 40, color: Colors.grey[400]),
-                                      const SizedBox(height: 8),
-                                      Text(
-                                        "No paired devices found",
-                                        textAlign: TextAlign.center,
-                                        style: TextStyle(color: Colors.grey[600], fontWeight: FontWeight.bold),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        "Link the printer in settings, then press Search.",
-                                        textAlign: TextAlign.center,
-                                        style: TextStyle(color: Colors.grey[500], fontSize: 12),
-                                      ),
-                                    ],
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            side: BorderSide(
+                              color: Theme.of(context).colorScheme.outlineVariant,
+                              width: 0.5,
+                            ),
+                          ),
+                          clipBehavior: Clip.antiAlias, // Mantiene los bordes redondeados al hacer tap
+                          child: items.isEmpty
+                              ? Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(16.0),
+                                    child: Column(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(Icons.print_disabled, size: 40, color: Colors.grey[400]),
+                                        const SizedBox(height: 8),
+                                        Text(
+                                          "No paired devices found",
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(color: Colors.grey[600], fontWeight: FontWeight.bold),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          "Link the printer in settings, then press Search.",
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                                        ),
+                                      ],
+                                    ),
                                   ),
+                                )
+                              : ListView.separated(
+                                  padding: const EdgeInsets.all(8),
+                                  itemCount: items.length,
+                                  separatorBuilder: (context, index) => const Divider(height: 1),
+                                  itemBuilder: (context, index) {
+                                    final item = items[index];
+                                    return ListTile(
+                                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                                      leading: CircleAvatar(
+                                        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                                        child: Icon(Icons.print, color: Theme.of(context).colorScheme.onPrimaryContainer, size: 20),
+                                      ),
+                                      title: Text(
+                                        item.name.isNotEmpty ? item.name : "Unknown Device",
+                                        style: const TextStyle(fontWeight: FontWeight.bold),
+                                      ),
+                                      subtitle: Text(
+                                        "MAC: ${item.macAdress}",
+                                        style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.grey[600]),
+                                      ),
+                                      trailing: const Icon(Icons.chevron_right, size: 18),
+                                      onTap: () => connect(item.macAdress),
+                                    );
+                                  },
                                 ),
-                              )
-                            : ListView.separated(
-                                padding: const EdgeInsets.all(8),
-                                itemCount: items.length,
-                                separatorBuilder: (context, index) => const Divider(height: 1),
-                                itemBuilder: (context, index) {
-                                  final item = items[index];
-                                  return ListTile(
-                                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                                    leading: CircleAvatar(
-                                      backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-                                      child: Icon(Icons.print, color: Theme.of(context).colorScheme.onPrimaryContainer, size: 20),
-                                    ),
-                                    title: Text(
-                                      item.name.isNotEmpty ? item.name : "Unknown Device",
-                                      style: const TextStyle(fontWeight: FontWeight.bold),
-                                    ),
-                                    subtitle: Text(
-                                      "MAC: ${item.macAdress}",
-                                      style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.grey[600]),
-                                    ),
-                                    trailing: const Icon(Icons.chevron_right, size: 18),
-                                    onTap: () => connect(item.macAdress),
-                                  );
-                                },
-                              ),
+                        ),
                       ),
                       if (connected) ...[
                         const SizedBox(height: 12),

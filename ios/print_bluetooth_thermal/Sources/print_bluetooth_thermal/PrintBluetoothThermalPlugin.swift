@@ -10,7 +10,11 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
     private var targetCharacteristic: CBCharacteristic?
     private var discoveredDevices: [String] = []
 
-    // UUIDs comunes en impresoras térmicas BLE / ESC-POS
+    // Control de flujo para escritura
+    private var pendingData: Data = Data()
+    private var pendingResult: FlutterResult?
+    private var writeWatchdogTimer: Timer?
+
     private let allowedServiceUUIDs: [CBUUID] = [
         CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB"),
         CBUUID(string: "49535343-FE7D-4AE5-8FA9-9FAFD205E455"),
@@ -56,11 +60,9 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
 
         case "ispermissionbluetoothgranted":
             if #available(iOS 13.1, *) {
-                let auth = CBCentralManager.authorization
-                result(auth == .allowedAlways)
+                result(CBCentralManager.authorization == .allowedAlways)
             } else if #available(iOS 13.0, *) {
-                let auth = centralManager?.authorization ?? .notDetermined
-                result(auth == .allowedAlways)
+                result((centralManager?.authorization ?? .notDetermined) == .allowedAlways)
             } else {
                 result(centralManager?.state == .poweredOn)
             }
@@ -72,8 +74,7 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
             handleConnect(call: call, result: result)
 
         case "connectionstatus":
-            let isConnected = (connectedPeripheral?.state == .connected)
-            result(isConnected)
+            result(connectedPeripheral?.state == .connected)
 
         case "writebytes":
             handleWriteBytes(call: call, result: result)
@@ -90,18 +91,16 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
     }
 
     // =======================================================
-    // Handlers de Métodos
+    // Handlers
     // =======================================================
 
     private func handleScanDevices(result: @escaping FlutterResult) {
         discoveredDevices.removeAll()
-
         guard centralManager?.state == .poweredOn else {
             result(discoveredDevices)
             return
         }
 
-        // Obtener dispositivos ya conectados al sistema con servicios conocidos
         let connectedList = centralManager?.retrieveConnectedPeripherals(withServices: allowedServiceUUIDs) ?? []
         for peripheral in connectedList {
             let name = peripheral.name ?? "Unknown"
@@ -111,10 +110,8 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
             }
         }
 
-        // Iniciar escaneo BLE general
         centralManager?.scanForPeripherals(withServices: nil, options: nil)
 
-        // Detener escaneo tras 4 segundos y devolver resultados
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
             guard let self = self else { return }
             self.centralManager?.stopScan()
@@ -139,7 +136,6 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
         connectedPeripheral?.delegate = self
         centralManager?.connect(peripheral, options: nil)
 
-        // Esperar conexión y descubrir servicios
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
             guard let self = self else { return }
             if self.connectedPeripheral?.state == .connected {
@@ -164,29 +160,29 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
 
         guard let data = rawData,
               let peripheral = connectedPeripheral,
-              let characteristic = targetCharacteristic else {
+              let characteristic = targetCharacteristic,
+              peripheral.state == .connected else {
             result(false)
             return
         }
 
-        let chunkSize = 150
-        var offset = 0
-        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-
-        while offset < data.count {
-            let chunkRange = offset..<min(offset + chunkSize, data.count)
-            let chunkData = data.subdata(in: chunkRange)
-            peripheral.writeValue(chunkData, for: characteristic, type: writeType)
-            offset += chunkSize
+        // Si ya había una escritura en proceso, terminamos la anterior con error
+        if pendingResult != nil {
+            completePendingWrite(success: false)
         }
 
-        result(true)
+        self.pendingData = data
+        self.pendingResult = result
+
+        // Iniciar un watchdog de 10s para evitar que el Future quede colgado si la impresora se apaga
+        startWatchdog()
+
+        // Comenzar a drenar los datos con control de flujo
+        sendNextChunk()
     }
 
     private func handlePrintString(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let stringPrint = call.arguments as? String,
-              let peripheral = connectedPeripheral,
-              let characteristic = targetCharacteristic else {
+        guard let stringPrint = call.arguments as? String else {
             result(false)
             return
         }
@@ -211,21 +207,93 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
         ]
         let resetBytes: [UInt8] = [0x1b, 0x40]
 
-        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-
-        // 1. Tamaño
-        peripheral.writeValue(Data(sizeBytes[size]), for: characteristic, type: writeType)
-        // 2. Texto
+        // Empaquetar todo en un solo payload y usar el mismo control de flujo
+        var fullData = Data(sizeBytes[size])
         if let textData = texto.data(using: .isoLatin1) ?? texto.data(using: .utf8) {
-            peripheral.writeValue(textData, for: characteristic, type: writeType)
+            fullData.append(textData)
         }
-        // 3. Reset / Salto
-        peripheral.writeValue(Data(resetBytes), for: characteristic, type: writeType)
+        fullData.append(Data(resetBytes))
 
-        result(true)
+        guard let peripheral = connectedPeripheral,
+              let characteristic = targetCharacteristic,
+              peripheral.state == .connected else {
+            result(false)
+            return
+        }
+
+        if pendingResult != nil {
+            completePendingWrite(success: false)
+        }
+
+        self.pendingData = fullData
+        self.pendingResult = result
+        startWatchdog()
+        sendNextChunk()
+    }
+
+    // =======================================================
+    // Flujo de Control BLE (Drenado de paquetes)
+    // =======================================================
+
+    private func sendNextChunk() {
+        guard let peripheral = connectedPeripheral,
+              let characteristic = targetCharacteristic,
+              pendingResult != nil else { return }
+
+        // Reiniciar watchdog: mientras haya progreso, no se reinicia para evitar el corte en imagenes pesadas
+        startWatchdog()
+
+        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        let maxChunk = peripheral.maximumWriteValueLength(for: writeType)
+        let chunkSize = min(maxChunk > 0 ? maxChunk : 150, 150)
+
+        if writeType == .withoutResponse {
+            // Mientras iOS tenga espacio en el buffer y queden datos por enviar
+            while !pendingData.isEmpty && peripheral.canSendWriteWithoutResponse {
+                let bytesToSend = min(chunkSize, pendingData.count)
+                let chunk = pendingData.subdata(in: 0..<bytesToSend)
+                pendingData.removeSubrange(0..<bytesToSend)
+
+                peripheral.writeValue(chunk, for: characteristic, type: .withoutResponse)
+            }
+
+            // Si ya no quedan datos, la escritura terminó exitosamente
+            if pendingData.isEmpty {
+                completePendingWrite(success: true)
+            }
+            // Si aún quedan datos pero canSendWriteWithoutResponse es false,
+            // nos detenemos y esperamos a peripheralIsReady(toSendWriteWithoutResponse:)
+        } else {
+            // Con respuesta: enviar 1 chunk y esperar didWriteValueFor
+            if !pendingData.isEmpty {
+                let bytesToSend = min(chunkSize, pendingData.count)
+                let chunk = pendingData.subdata(in: 0..<bytesToSend)
+                pendingData.removeSubrange(0..<bytesToSend)
+
+                peripheral.writeValue(chunk, for: characteristic, type: .withResponse)
+            } else {
+                completePendingWrite(success: true)
+            }
+        }
+    }
+
+    private func startWatchdog() {
+        writeWatchdogTimer?.invalidate()
+        writeWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
+            self?.completePendingWrite(success: false)
+        }
+    }
+
+    private func completePendingWrite(success: Bool) {
+        writeWatchdogTimer?.invalidate()
+        writeWatchdogTimer = nil
+        pendingData.removeAll()
+        pendingResult?(success)
+        pendingResult = nil
     }
 
     private func handleDisconnect(result: @escaping FlutterResult) {
+        completePendingWrite(success: false)
         if let peripheral = connectedPeripheral {
             centralManager?.cancelPeripheralConnection(peripheral)
         }
@@ -239,17 +307,10 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
     // =======================================================
 
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        switch central.state {
-        case .poweredOn:
-            print("CoreBluetooth: Encendido y listo")
-        case .poweredOff:
-            print("CoreBluetooth: Apagado")
+        if central.state != .poweredOn {
+            completePendingWrite(success: false)
             connectedPeripheral = nil
             targetCharacteristic = nil
-        case .unauthorized:
-            print("CoreBluetooth: No autorizado")
-        default:
-            break
         }
     }
 
@@ -264,6 +325,7 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        completePendingWrite(success: false)
         connectedPeripheral = nil
         targetCharacteristic = nil
     }
@@ -273,33 +335,35 @@ public class PrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentralMana
     // =======================================================
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error = error {
-            print("Error descubriendo servicios: \(error.localizedDescription)")
-            return
-        }
-
-        guard let services = peripheral.services else { return }
+        guard error == nil, let services = peripheral.services else { return }
         for service in services {
             peripheral.discoverCharacteristics(nil, for: service)
         }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        if let error = error {
-            print("Error descubriendo características: \(error.localizedDescription)")
-            return
-        }
-
-        guard let characteristics = service.characteristics else { return }
-
+        guard error == nil, let characteristics = service.characteristics else { return }
         for characteristic in characteristics {
             if allowedCharacteristicUUIDs.contains(characteristic.uuid) ||
                characteristic.properties.contains(.write) ||
                characteristic.properties.contains(.writeWithoutResponse) {
                 targetCharacteristic = characteristic
-                print("Característica de impresión seleccionada: \(characteristic.uuid)")
                 break
             }
+        }
+    }
+
+    // LLAMADO CUANDO EL BUFFER BLE VUELVE A TENER ESPACIO (.withoutResponse)
+    public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        sendNextChunk()
+    }
+
+    // LLAMADO CUANDO LA IMPRESORA CONFIRMA RECEPCIÓN (.withResponse)
+    public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if error != nil {
+            completePendingWrite(success: false)
+        } else {
+            sendNextChunk()
         }
     }
 }
